@@ -197,14 +197,21 @@ def _update_joint_positions_with_admittance(
 def _send_joint_commands(
     target_joint_pos: dict[str, np.ndarray],
     arms: dict[str, Arm],
+    green_button_states: dict[str, bool] | None = None,
+    need_button: bool = False,
 ) -> None:
     """Send joint position commands to robot arms.
 
     Args:
         target_joint_pos: Dictionary of target joint positions.
         arms: Dictionary of arm objects.
+        green_button_states: Dictionary of green button states per arm.
+        need_button: Whether button press is required for activation.
     """
     for arm in ("left", "right"):
+        if need_button and green_button_states is not None:
+            if not green_button_states[arm]:
+                continue
         arms[arm].set_joint_pos(target_joint_pos[arm].tolist())
 
 
@@ -213,6 +220,7 @@ def main(
     kd_gain: float = 0.1,
     control_hz: float = 200.0,
     force_thresholds: list[float] = [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25],
+    need_button: bool = False,
 ) -> None:
     """Main function for joint-level admittance control demo.
 
@@ -231,6 +239,8 @@ def main(
         force_thresholds: List of thresholds for force activation [A] for each joint.
             Current readings below these thresholds are ignored for each joint.
             Default is [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25] for all 7 joints.
+        need_button: If True, the robot arm will move only when the green button is
+            pressed. If False, the robot arm will move continuously.
     """
     if kd_gain < 0.3:
         logger.warning("kd_gain is too small. Setting to 0.3.")
@@ -246,6 +256,14 @@ def main(
     # Initialize robot and components
     bot = Robot()
     arms = {"left": bot.left_arm, "right": bot.right_arm}
+
+    # Validate wrench sensors if button activation is required
+    if need_button:
+        if bot.left_arm.wrench_sensor is None or bot.right_arm.wrench_sensor is None:
+            raise ValueError(
+                "Green button activation requires both left and right wrench "
+                "sensors to be present."
+            )
 
     # Get initial joint positions and currents
     init_joint_pos = _get_initial_joint_positions(bot)
@@ -274,6 +292,23 @@ def main(
 
     try:
         while True:
+            # Get green button states if button activation is required
+            green_button_states: dict[str, bool] | None = None
+            if need_button:
+                green_button_states = {
+                    "left": bot.left_arm.wrench_sensor.get_green_button_state(),  # type: ignore
+                    "right": bot.right_arm.wrench_sensor.get_green_button_state(),  # type: ignore
+                }
+
+            # Check activation condition
+            activated = True
+            if need_button and green_button_states is not None:
+                activated = any(green_button_states.values())
+
+            if not activated:
+                rate_limiter.sleep()
+                continue
+
             # Get current joint positions and currents
             current_joint_pos = {
                 "left": np.array(bot.left_arm.get_joint_pos()),
@@ -305,7 +340,9 @@ def main(
             )
 
             # Send joint commands
-            _send_joint_commands(target_joint_pos, arms)
+            _send_joint_commands(
+                target_joint_pos, arms, green_button_states, need_button
+            )
 
             rate_limiter.sleep()
 

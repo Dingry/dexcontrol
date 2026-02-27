@@ -15,6 +15,16 @@ identification. For optimal performance, it is recommended to:
 1. Perform proper system identification
 2. Run this code on a Jetson or PC connected to the robot via ethernet, as admittance
    control performance is sensitive to network latency
+
+Tuning guide:
+    - If the arm is **shaky/oscillating**, increase ``damping_scale`` (e.g. 2.0–5.0)
+      or decrease ``kd_gain``. Also try raising ``filter_alpha`` towards 1.0 for
+      heavier smoothing.
+    - If the arm feels **sluggish**, decrease ``damping_scale`` or increase ``kd_gain``.
+      Lower ``filter_alpha`` towards 0.0 for less smoothing.
+    - ``kd_gain`` scales both stiffness (K) and damping (D) together.
+    - ``damping_scale`` scales **only** the damping (D) on top of ``kd_gain``, so it
+      directly controls the K/D ratio and system bandwidth.
 """
 
 from typing import Literal
@@ -32,6 +42,47 @@ from dexcontrol.core.arm import Arm
 from dexcontrol.robot import Robot
 
 
+class WrenchLowPassFilter:
+    """Exponential moving average (EMA) low-pass filter for wrench signals.
+
+    Smooths noisy force/torque sensor readings to prevent high-frequency
+    oscillations in admittance control.  The filter equation is::
+
+        y[k] = alpha * y[k-1] + (1 - alpha) * x[k]
+
+    where ``alpha`` ∈ [0, 1) controls the amount of smoothing
+    (higher = smoother but more lag).
+    """
+
+    def __init__(self, alpha: float = 0.5, dim: int = 6) -> None:
+        """Initialize the low-pass filter.
+
+        Args:
+            alpha: Smoothing factor in [0, 1). 0 = no filtering,
+                0.9 = very heavy filtering. Good starting range: 0.3–0.7.
+            dim: Dimension of the wrench vector (default 6).
+        """
+        assert 0.0 <= alpha < 1.0, "alpha must be in [0, 1)"
+        self._alpha = alpha
+        self._prev: np.ndarray | None = None
+        self._dim = dim
+
+    def filter(self, wrench: np.ndarray) -> np.ndarray:
+        """Apply one step of the EMA filter.
+
+        Args:
+            wrench: Raw wrench reading of shape ``(dim,)``.
+
+        Returns:
+            Filtered wrench of shape ``(dim,)``.
+        """
+        if self._prev is None:
+            self._prev = wrench.copy()
+            return wrench.copy()
+        self._prev = self._alpha * self._prev + (1.0 - self._alpha) * wrench
+        return self._prev.copy()
+
+
 class AdmittanceController:
     """Admittance controller for robot end-effector force control.
 
@@ -43,6 +94,7 @@ class AdmittanceController:
     def __init__(
         self,
         kd_gain: float = 1.0,
+        damping_scale: float = 3.0,
         dt: float = 0.01,
         zero_force_control: bool = False,
     ) -> None:
@@ -50,12 +102,20 @@ class AdmittanceController:
 
         Args:
             kd_gain: Gain multiplier for stiffness and damping matrices.
+            damping_scale: Extra multiplier applied **only** to the damping
+                matrix D.  Increasing this lowers the K/D ratio (= lower
+                bandwidth) and suppresses oscillations.  Values in 1.0–5.0
+                are typical; higher = smoother but slower response.
             dt: Control loop time step in seconds.
             zero_force_control: If True, reduces stiffness for zero-force mode.
         """
         self.is_zero_force_control = zero_force_control
         self.K = np.diag([500.0, 500.0, 500.0, 20.0, 20.0, 10.0]) * kd_gain
-        self.D = np.diag([5.0, 5.0, 5.0, 0.05, 0.05, 0.05]) * kd_gain
+        # Angular damping raised from 0.05 → 0.5 to reduce rotational shaking,
+        # then further scaled by damping_scale for easy tuning.
+        self.D = (
+            np.diag([5.0, 5.0, 5.0, 0.5, 0.5, 0.5]) * kd_gain * damping_scale
+        )
         self.dt = dt
         if zero_force_control:
             self.K = self.K / 5
@@ -240,6 +300,7 @@ def _update_ee_poses_with_admittance(
     admittance_controller: AdmittanceController,
     init_ee_pose: dict[str, np.ndarray],
     zero_force: bool,
+    wrench_filters: dict[str, WrenchLowPassFilter] | None = None,
 ) -> None:
     """Update end-effector poses using admittance control.
 
@@ -250,9 +311,12 @@ def _update_ee_poses_with_admittance(
         admittance_controller: Admittance controller instance.
         init_ee_pose: Dictionary of initial end-effector poses.
         zero_force: Whether to use zero-force mode.
+        wrench_filters: Optional per-arm low-pass filters for wrench smoothing.
     """
     for arm in ("left", "right"):
         wrench = preprocess_wrench(wrench_states[arm]["wrench"], init_wrench[arm], arm)
+        if wrench_filters is not None:
+            wrench = wrench_filters[arm].filter(wrench)
         new_pose = admittance_controller.get_admittance_pose(
             pose_cur=ee_pose[arm],
             wrench_ext=wrench,
@@ -287,6 +351,8 @@ def _send_joint_commands(
 def main(
     zero_force: bool = True,
     kd_gain: float = 1.0,
+    damping_scale: float = 3.0,
+    filter_alpha: float = 0.5,
     need_button: bool = False,
 ) -> None:
     """Main function for admittance control demo.
@@ -303,6 +369,12 @@ def main(
             If False, maintain initial pose while responding to external forces.
         kd_gain: Gain for the admittance controller. The larger the gain, the stiffer
             the robot arm will move under external force.
+        damping_scale: Extra multiplier applied only to the damping matrix.
+            Increase (e.g. 3.0–5.0) to suppress oscillations / shakiness.
+            Decrease (e.g. 1.0) for faster but less stable response.
+        filter_alpha: EMA smoothing factor for wrench readings in [0, 1).
+            0.0 = no filtering, 0.9 = very heavy smoothing.
+            Recommended range: 0.3–0.7. Increase if shaky.
         need_button: If True, the robot arm will move only when the blue button is
             pressed. If False, the robot arm will move continuously.
     """
@@ -333,8 +405,15 @@ def main(
     admittance_controller = AdmittanceController(
         zero_force_control=zero_force,
         kd_gain=kd_gain,
+        damping_scale=damping_scale,
         dt=ik_solver.dt,
     )
+
+    # Initialize wrench low-pass filters (one per arm)
+    wrench_filters: dict[str, WrenchLowPassFilter] = {
+        "left": WrenchLowPassFilter(alpha=filter_alpha),
+        "right": WrenchLowPassFilter(alpha=filter_alpha),
+    }
 
     # Setup rate limiter
     ik_hz = 1 / ik_solver.dt
@@ -382,6 +461,7 @@ def main(
                     admittance_controller,
                     init_ee_pose,
                     zero_force,
+                    wrench_filters,
                 )
 
                 # Solve inverse kinematics

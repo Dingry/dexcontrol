@@ -55,7 +55,7 @@ example = [
     "dualsense-controller>=0.3.1",
     "pytransform3d==3.13.0",
     "dexmotion>=0.2.1",
-    "scipy>=1.16.1"
+    "scipy"
 ]
 
 [project.urls]
